@@ -1,0 +1,187 @@
+name: ARMSX2 Nevoa - Android Auto Nightly
+
+# Place this file on the fork's DEFAULT branch, which should be 'nevoa'.
+on:
+  schedule:
+    - cron: '43 4 * * *' # Check source once a day, at 04:43 UTC.
+  workflow_dispatch:
+  push:
+    branches: [nevoa]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nevoa-auto-release
+  cancel-in-progress: false
+
+jobs:
+  android:
+    name: Sync, test, build and release (ARM64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout your Nevoa branch
+        uses: actions/checkout@v4
+        with:
+          ref: nevoa
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: true
+
+      - name: Merge new Nevoa changes (do not force-push)
+        if: github.event_name != 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add nevoa-source https://github.com/joaovicbentes10/ARMSX2.git
+          git fetch --no-tags nevoa-source nevoa
+          if git merge-base --is-ancestor nevoa-source/nevoa HEAD; then
+            echo 'Nevoa source already included.'
+          else
+            # On conflict, abort and fail: never replace your modifications silently.
+            if ! git merge --no-edit --no-ff nevoa-source/nevoa; then
+              git merge --abort || true
+              echo '::error::Merge conflict with Nevoa; review manually. Nothing published.'
+              exit 1
+            fi
+          fi
+          git submodule update --init --recursive
+
+      - name: Decide whether this source revision already has a release
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          SHORT="${SHA:0:12}"
+          TAG="nevoa-${SHORT}"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'build=false' >> "$GITHUB_OUTPUT"
+            echo 'Already published this exact revision. Skipping build.'
+          else
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up JDK 17
+        if: steps.version.outputs.build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        if: steps.version.outputs.build == 'true'
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install pinned NDK and CMake
+        if: steps.version.outputs.build == 'true'
+        shell: bash
+        run: |
+          set -e
+          sdkmanager 'ndk;29.0.14206865' 'cmake;3.31.6'
+
+      - name: Fetch shaderc dependencies and Rust target
+        if: steps.version.outputs.build == 'true'
+        working-directory: platforms/android
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 app/src/main/cpp/3rdparty/shaderc/utils/git-sync-deps
+          rustup target add aarch64-linux-android
+
+      - name: Configure stable release signing
+        if: steps.version.outputs.build == 'true'
+        working-directory: platforms/android
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.NEVOA_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.NEVOA_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.NEVOA_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.NEVOA_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$KS_B64" || -z "$KS_PASS" || -z "$KS_ALIAS" || -z "$KEY_PASS" ]]; then
+            echo '::error::Set the four NEVOA_* secrets first. Never distribute APKs with temporary signatures.'
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KS_B64" | base64 --decode > nevoa-ci.jks
+          {
+            printf 'storeFile=nevoa-ci.jks\n'
+            printf 'storePassword=%s\n' "$KS_PASS"
+            printf 'keyAlias=%s\n' "$KS_ALIAS"
+            printf 'keyPassword=%s\n' "$KEY_PASS"
+          } > armsx2_keystore.properties
+          test -s nevoa-ci.jks
+
+      - name: Test and build release APK
+        if: steps.version.outputs.build == 'true'
+        working-directory: platforms/android
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          VERSION_CODE=$((1000000 + GITHUB_RUN_NUMBER))
+          ./gradlew \
+            :app:testGithubDebugUnitTest \
+            :app:assembleGithubRelease \
+            '-Parmsx2.applicationId=com.thecrixux.armsx2nevoa' \
+            '-Parmsx2.appLabel=ARMSX2 Névoa (Crixux)' \
+            "-Parmsx2.versionCode=$VERSION_CODE" \
+            "-Parmsx2.versionName=nevoa-${{ steps.version.outputs.short }}" \
+            --no-daemon --stacktrace
+
+      - name: Verify and rename the APK
+        if: steps.version.outputs.build == 'true'
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t apks < <(find platforms/android/app/build/outputs/apk/github/release -type f -name '*.apk' | sort)
+          if (( ${#apks[@]} != 1 )); then
+            echo "::error::Expected 1 release APK, got ${#apks[@]}"
+            exit 1
+          fi
+          cp "${apks[0]}" "$GITHUB_WORKSPACE/ARMSX2-Nevoa-Nightly.apk"
+          unzip -tq ARMSX2-Nevoa-Nightly.apk >/dev/null
+          unzip -Z -1 ARMSX2-Nevoa-Nightly.apk | grep '^lib/arm64-v8a/libemucore_4k\.so$'
+          sha256sum ARMSX2-Nevoa-Nightly.apk
+
+      - name: Upload APK as an Actions artifact
+        if: steps.version.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ARMSX2-Nevoa-Nightly-${{ steps.version.outputs.short }}
+          path: ARMSX2-Nevoa-Nightly.apk
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Publish the successfully built source revision
+        if: steps.version.outputs.build == 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # An Actions GITHUB_TOKEN push does not trigger the inherited workflows again.
+          # The source revision is only pushed after building and validation have passed.
+          git push origin HEAD:nevoa
+          gh release create "$TAG" 'ARMSX2-Nevoa-Nightly.apk' \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "ARMSX2 Névoa Nightly - ${TAG#nevoa-}" \
+            --notes "Community-built, unofficial Android ARM64 APK. Based on joaovicbentes10/ARMSX2 (nevoa). Source commit: $SHA. GPLv3 source available in this fork. This build is not an official ARMSX2 release." \
+            --latest
