@@ -1,0 +1,269 @@
+# Install as .github/workflows/nevoa-nightly.yml on the DEFAULT branch: Nevoa.
+# Replaces the old nevoa-nightly.yml; it builds THIS repository, without merging
+# another repository. Android ARM64 only, with both 4 KB and 16 KB native cores.
+#
+# Required repository secrets (Settings > Secrets and variables > Actions):
+#   NEVOA_KEYSTORE_B64      Base64 of your existing release .jks keystore
+#   NEVOA_KEYSTORE_PASSWORD Keystore password
+#   NEVOA_KEY_ALIAS         Signing alias
+#   NEVOA_KEY_PASSWORD      Private key password
+# Reuse the SAME key on every run so installed nightlies can update in place.
+# If no key exists yet, generate one ONCE and keep it backed up:
+#   keytool -genkeypair -keystore nevoa.jks -alias nevoa -keyalg RSA \
+#     -keysize 3072 -validity 10000 -dname 'CN=ARMSX2 Nevoa Nightly'
+#   base64 -w0 nevoa.jks   # Linux/Termux: copy the result into NEVOA_KEYSTORE_B64.
+# No personal access token is needed: publishing uses the built-in GITHUB_TOKEN.
+# Disable any other scheduled release workflow if it should no longer run.
+name: ARMSX2 Nevoa - Android Nightly
+
+on:
+  schedule:
+    - cron: '43 4 * * *' # Daily at 04:43 UTC (05:43/06:43 mainland Spain).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nevoa-android-nightly-release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check for an unpublished revision
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      build: ${{ steps.version.outputs.build }}
+      sha: ${{ steps.version.outputs.sha }}
+      short: ${{ steps.version.outputs.short }}
+      tag: ${{ steps.version.outputs.tag }}
+      date: ${{ steps.version.outputs.date }}
+      code: ${{ steps.version.outputs.code }}
+    steps:
+      - name: Check out Nevoa (case sensitive)
+        uses: actions/checkout@v7
+        with:
+          ref: Nevoa
+          persist-credentials: false
+
+      - name: Skip commits already published by this workflow
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          SHORT="${SHA:0:12}"
+          TAG="nightly-android-${SHORT}"
+          # An API/auth/network error must fail; it must not look like 'no release'.
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > releases.json
+          COUNT="$(jq --arg tag "$TAG" '[.[][] | select(.tag_name == $tag and .draft == false)] | length' releases.json)"
+          {
+            echo "sha=$SHA"
+            echo "short=$SHORT"
+            echo "tag=$TAG"
+            echo "date=$(date -u +%Y%m%d)"
+            # Epoch minutes: increasing across different workflows and below Android's limit.
+            echo "code=$(( $(date -u +%s) / 60 ))"
+            if (( COUNT == 0 )); then echo 'build=true'; else echo 'build=false'; fi
+          } >> "$GITHUB_OUTPUT"
+          if (( COUNT > 0 )); then
+            echo 'This source revision already has an Android Nightly. Skipping.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  android:
+    name: Build, verify and publish Android ARM64
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA: ${{ needs.check.outputs.sha }}
+      SHORT_SHA: ${{ needs.check.outputs.short }}
+      RELEASE_TAG: ${{ needs.check.outputs.tag }}
+      BUILD_DATE: ${{ needs.check.outputs.date }}
+      VERSION_CODE: ${{ needs.check.outputs.code }}
+      APK_ID: com.armsx2.nevoa
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Validate the persistent signing key before compiling
+        env:
+          KS_B64: ${{ secrets.NEVOA_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.NEVOA_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.NEVOA_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.NEVOA_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in KS_B64 KS_PASS KEY_ALIAS KEY_PASS; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing signing secret ($name). Configure the four NEVOA_* secrets listed at the top of this workflow."
+              exit 1
+            fi
+          done
+          umask 077
+          printf '%s' "$KS_B64" | base64 --decode > "$RUNNER_TEMP/nevoa.jks"
+          keytool -list -keystore "$RUNNER_TEMP/nevoa.jks" \
+            -storepass:env KS_PASS -alias "$KEY_ALIAS" >/dev/null
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install the repository's Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager 'platforms;android-37' 'build-tools;37.0.0' \
+            'ndk;29.0.14206865' 'cmake;3.31.6'
+          rustup target add aarch64-linux-android
+
+      - name: Fetch shader compiler dependencies
+        working-directory: platforms/android
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          python3 app/src/main/cpp/3rdparty/shaderc/utils/git-sync-deps
+
+      - name: Build both native cores and package one signed APK
+        working-directory: platforms/android
+        env:
+          KS_PASS: ${{ secrets.NEVOA_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.NEVOA_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.NEVOA_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/nevoa-package"
+          mkdir -p "$WORK/lib/arm64-v8a" "$GITHUB_WORKSPACE/dist"
+          PGO_ARGS=(-Parmsx2.pgo=none)
+          if [[ -s pgo/armsx2.profdata ]]; then
+            PGO_ARGS=(-Parmsx2.pgo=optimize "-Parmsx2.pgoProfile=$PWD/pgo/armsx2.profdata")
+          fi
+          BUILT='app/build/outputs/apk/github/release/app-github-release.apk'
+          for VARIANT in 4k 16k; do
+            PAGE=0x1000
+            if [[ "$VARIANT" == 16k ]]; then PAGE=0x4000; fi
+            # Release .so outputs are copied before cleaning the native workspace.
+            ./gradlew :app:cleanCxx --no-daemon
+            rm -f "$BUILT"
+            ./gradlew :app:assembleGithubRelease \
+              "-Parmsx2.applicationId=$APK_ID" \
+              '-Parmsx2.appLabel=ARMSX2 Nevoa Nightly' \
+              '-Parmsx2.channel=nightly' \
+              "-Parmsx2.versionCode=$VERSION_CODE" \
+              "-Parmsx2.versionName=nightly.${BUILD_DATE}.${SHORT_SHA}" \
+              "-Parmsx2.hostPageSize=$PAGE" \
+              "-Parmsx2.nativeLibName=emucore_$VARIANT" \
+              "${PGO_ARGS[@]}" --no-daemon --stacktrace --max-workers=2
+            test -s "$BUILT"
+            unzip -p "$BUILT" "lib/arm64-v8a/libemucore_${VARIANT}.so" \
+              > "$WORK/lib/arm64-v8a/libemucore_${VARIANT}.so"
+            test -s "$WORK/lib/arm64-v8a/libemucore_${VARIANT}.so"
+            if [[ "$VARIANT" == 4k ]]; then cp "$BUILT" "$WORK/unsigned.apk"; fi
+          done
+          # Gradle signs intermediate APKs; always re-sign the merged APK with our key.
+          # Remove only signatures present in the base APK (do not mask zip errors).
+          python3 - "$WORK/unsigned.apk" <<'PY'
+          import os, sys, zipfile
+          path = sys.argv[1]
+          with zipfile.ZipFile(path) as src, zipfile.ZipFile(path + '.tmp', 'w') as dst:
+              for item in src.infolist():
+                  upper = item.filename.upper()
+                  signature = upper.startswith('META-INF/') and (
+                      upper.endswith(('.SF', '.RSA', '.DSA', '.EC')) or upper == 'META-INF/MANIFEST.MF')
+                  if signature or item.filename in (
+                      'lib/arm64-v8a/libemucore_4k.so', 'lib/arm64-v8a/libemucore_16k.so'):
+                      continue
+                  dst.writestr(item, src.read(item.filename))
+          os.replace(path + '.tmp', path)
+          PY
+          (cd "$WORK" && zip -q -9 unsigned.apk lib/arm64-v8a/libemucore_4k.so lib/arm64-v8a/libemucore_16k.so)
+          BT="$ANDROID_HOME/build-tools/37.0.0"
+          "$BT/zipalign" -f -P 16 4 "$WORK/unsigned.apk" "$WORK/aligned.apk"
+          APK="$GITHUB_WORKSPACE/dist/ARMSX2-Nevoa-Nightly-${BUILD_DATE}-${SHORT_SHA}-Android-arm64.apk"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/nevoa.jks" \
+            --ks-key-alias "$KEY_ALIAS" --ks-pass env:KS_PASS --key-pass env:KEY_PASS \
+            --out "$APK" "$WORK/aligned.apk"
+          "$BT/apksigner" verify --verbose "$APK"
+          "$BT/zipalign" -c -P 16 4 "$APK"
+          unzip -tq "$APK"
+          "$BT/aapt2" dump badging "$APK" > "$WORK/badging.txt"
+          grep -F "package: name='$APK_ID'" "$WORK/badging.txt"
+          grep -F "versionCode='$VERSION_CODE'" "$WORK/badging.txt"
+          python3 - "$APK" <<'PY'
+          import sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as apk:
+              for core in ('4k', '16k'):
+                  name = f'lib/arm64-v8a/libemucore_{core}.so'
+                  if apk.getinfo(name).file_size < 10_000_000:
+                      raise SystemExit(f'Native core is unexpectedly small: {name}')
+          PY
+          (cd "$GITHUB_WORKSPACE/dist" && sha256sum ./*.apk > SHA256SUMS.txt)
+
+      - name: Preserve the verified APK as an Actions artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Nevoa-Android-Nightly-${{ needs.check.outputs.short }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Publish the Android Nightly in GitHub Releases
+        shell: bash
+        run: |
+          set -euo pipefail
+          TITLE="ARMSX2 Nevoa Nightly - ${BUILD_DATE} (${SHORT_SHA})"
+          {
+            echo 'Automated community build of ARMSX2 Nevoa for Android ARM64.'
+            echo
+            echo '- Release build with 4 KB and 16 KB native cores in one APK.'
+            echo '- Package: com.armsx2.nevoa. Signed with the persistent Nevoa key.'
+            echo '- SHA-256 checksum included.'
+            echo
+            echo "Source: https://github.com/$GITHUB_REPOSITORY/tree/$SOURCE_SHA"
+            echo "Build log: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$RUNNER_TEMP/notes.md"
+          # Recover a draft left by a failed publish attempt; published tags were skipped.
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          COUNT="$(jq --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)] | length' "$RUNNER_TEMP/releases.json")"
+          if (( COUNT == 0 )); then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$SOURCE_SHA" --title "$TITLE" --notes-file "$RUNNER_TEMP/notes.md" \
+              --draft --prerelease
+          else
+            jq -e --arg tag "$RELEASE_TAG" \
+              '.[][] | select(.tag_name == $tag) | .draft == true' "$RUNNER_TEMP/releases.json" >/dev/null
+          fi
+          gh release upload "$RELEASE_TAG" dist/*.apk dist/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "$TITLE" --notes-file "$RUNNER_TEMP/notes.md" \
+            --draft=false --prerelease --latest=false
+          echo "Published: https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove signing material
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/nevoa.jks"
+        
